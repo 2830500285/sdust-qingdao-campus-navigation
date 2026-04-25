@@ -149,12 +149,13 @@ npm run build
 
 ### GitHub Pages
 
-仓库已经内置 Pages 工作流，推荐部署方式是：
+推荐部署方式是：
 
 1. 新建一个**单独仓库**，例如 `sdust-qingdao-campus-navigation`
-2. 推送代码到该仓库的 `main` 分支
-3. 在仓库 `Settings -> Pages` 中确认 `GitHub Actions` 为发布源
-4. 等待 `.github/workflows/deploy.yml` 完成后，站点会发布到：
+2. 推送源代码到该仓库的 `main` 分支
+3. 将 `dist/` 构建产物发布到 `gh-pages` 分支
+4. 在仓库 `Settings -> Pages` 中把发布源设为 `Deploy from a branch`
+5. 选择 `gh-pages` 分支和 `/ (root)` 目录后，站点会发布到：
 
 ```text
 https://<你的 GitHub 用户名>.github.io/<repo>/
