@@ -1,0 +1,107 @@
+@import url('https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;600;700;800&family=Outfit:wght@500;600;700;800&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap');
+
+:root {
+  color: #16315f;
+  background:
+    radial-gradient(circle at 15% 20%, rgba(124, 173, 255, 0.18), transparent 26%),
+    radial-gradient(circle at 88% 12%, rgba(193, 225, 255, 0.28), transparent 22%),
+    linear-gradient(180deg, #f8fbff 0%, #eef4ff 52%, #f7faff 100%);
+  font-family: 'Plus Jakarta Sans', 'Noto Sans SC', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  line-height: 1.5;
+  font-weight: 400;
+  text-rendering: optimizeLegibility;
+  font-synthesis: none;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  --ink: #16315f;
+  --muted: #61779e;
+  --paper: rgba(255, 255, 255, 0.72);
+  --paper-strong: rgba(255, 255, 255, 0.92);
+  --line: rgba(104, 147, 217, 0.2);
+  --line-strong: rgba(74, 122, 208, 0.34);
+  --accent: #3478f6;
+  --accent-dark: #1f57e7;
+  --accent-soft: rgba(52, 120, 246, 0.12);
+  --accent-strong: #0f41c5;
+  --green: #5eb7ff;
+  --route-start: #43b4ff;
+  --route-end: #2454ea;
+  --shadow: 0 28px 80px rgba(77, 114, 185, 0.16);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+  color: var(--ink);
+  background: transparent;
+}
+
+body::before {
+  position: fixed;
+  inset: 0;
+  z-index: -2;
+  background:
+    radial-gradient(circle at 0% 100%, rgba(89, 142, 255, 0.18), transparent 28%),
+    radial-gradient(circle at 100% 18%, rgba(166, 216, 255, 0.22), transparent 24%),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.88), rgba(243, 248, 255, 0.9));
+  content: '';
+  pointer-events: none;
+}
+
+body::after {
+  position: fixed;
+  left: -12vw;
+  right: -12vw;
+  bottom: -24vh;
+  height: 58vh;
+  z-index: -1;
+  background:
+    radial-gradient(70% 100% at 50% 100%, rgba(82, 145, 255, 0.26), transparent 58%),
+    radial-gradient(70% 100% at 52% 100%, rgba(172, 214, 255, 0.22), transparent 68%),
+    repeating-radial-gradient(
+      ellipse at 50% 100%,
+      rgba(90, 147, 255, 0.18) 0,
+      rgba(90, 147, 255, 0.18) 2px,
+      transparent 2px,
+      transparent 28px
+    );
+  filter: blur(2px);
+  opacity: 0.95;
+  content: '';
+  pointer-events: none;
+}
+
+button,
+input,
+select {
+  font: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+img {
+  display: block;
+  max-width: 100%;
+}
+
+#root {
+  min-height: 100vh;
+  position: relative;
+  overflow: clip;
+}
