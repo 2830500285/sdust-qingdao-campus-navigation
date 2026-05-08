@@ -14,7 +14,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "preview": "npm run build && npm start",
-    "preview:client": "vite preview"
+    "preview:client": "vite preview",
+    "build:apk": "powershell -ExecutionPolicy Bypass -File scripts/build_android_webview_apk.ps1"
   },
   "dependencies": {
     "@amap/amap-jsapi-loader": "^1.0.1",

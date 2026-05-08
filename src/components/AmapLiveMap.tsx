@@ -13,6 +13,15 @@ declare global {
   interface DeviceOrientationEvent {
     webkitCompassHeading?: number
   }
+
+  interface Window {
+    SDUSTNativeTTS?: {
+      speak: (text: string) => void
+      stop?: () => void
+      isAvailable?: () => boolean
+      getStatus?: () => string
+    }
+  }
 }
 
 type DeviceOrientationPermissionState = 'granted' | 'denied' | 'prompt'
@@ -589,13 +598,53 @@ export function AmapLiveMap({
     return utterance
   }
 
-  function canUseSpeech() {
+  function getNativeTtsBridge() {
+    const bridge = window.SDUSTNativeTTS
+
+    if (!bridge) {
+      return null
+    }
+
+    try {
+      if (bridge.isAvailable && !bridge.isAvailable()) {
+        return null
+      }
+    } catch {
+      return null
+    }
+
+    return bridge
+  }
+
+  function canUseWebSpeech() {
     return 'speechSynthesis' in window && typeof SpeechSynthesisUtterance !== 'undefined'
   }
 
+  function canUseSpeech() {
+    return Boolean(getNativeTtsBridge()) || canUseWebSpeech()
+  }
+
+  function stopSpeech() {
+    getNativeTtsBridge()?.stop?.()
+
+    if ('speechSynthesis' in window) {
+      window.speechSynthesis.cancel()
+    }
+  }
+
   function primeSpeechEngine(text = '语音导航已开启') {
-    if (!canUseSpeech()) {
-      setVoiceStatus('当前浏览器不支持网页语音播报。')
+    const nativeTtsBridge = getNativeTtsBridge()
+
+    if (nativeTtsBridge) {
+      nativeTtsBridge.stop?.()
+      nativeTtsBridge.speak(text)
+      lastSpokenTextRef.current = text
+      setVoiceStatus('已调用 APK 原生语音播报。')
+      return true
+    }
+
+    if (!canUseWebSpeech()) {
+      setVoiceStatus('当前环境没有可用语音引擎；APK 需更新到带原生 TTS 桥的版本。')
       return false
     }
 
@@ -617,6 +666,16 @@ export function AmapLiveMap({
     }
 
     if (!force && lastSpokenTextRef.current === text) {
+      return
+    }
+
+    const nativeTtsBridge = getNativeTtsBridge()
+
+    if (nativeTtsBridge) {
+      nativeTtsBridge.stop?.()
+      nativeTtsBridge.speak(text)
+      setVoiceStatus('APK 原生语音正在播报。')
+      lastSpokenTextRef.current = text
       return
     }
 
@@ -1073,7 +1132,7 @@ export function AmapLiveMap({
       watchIdRef.current = null
     }
 
-    window.speechSynthesis?.cancel()
+    stopSpeech()
     stopHeadingTracking()
     isNavigatingRef.current = false
     isReplanningRef.current = false
@@ -1098,7 +1157,7 @@ export function AmapLiveMap({
     setVoiceEnabled(nextVoiceState)
 
     if (!nextVoiceState) {
-      window.speechSynthesis?.cancel()
+      stopSpeech()
       setVoiceStatus('语音已关闭。')
       return
     }
