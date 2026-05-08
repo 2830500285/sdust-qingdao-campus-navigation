@@ -690,14 +690,16 @@
   content: '';
 }
 
-.amap-user-marker span {
+.amap-user-marker__arrow {
   position: relative;
   width: 0;
   height: 0;
   border-left: 0.42rem solid transparent;
   border-right: 0.42rem solid transparent;
   border-bottom: 1.05rem solid white;
-  transform: translateY(-0.08rem) rotate(45deg);
+  transform: translateY(-0.08rem) rotate(calc(var(--heading, 0deg) + 45deg));
+  transform-origin: 50% 70%;
+  transition: transform 160ms linear;
 }
 
 .amap-navigation-card {
@@ -728,6 +730,8 @@
 
 .amap-navigation-card__header p,
 .amap-navigation-card__status,
+.amap-navigation-card__substatus,
+.amap-navigation-card__warning,
 .amap-navigation-card__instruction span,
 .amap-navigation-steps p,
 .amap-navigation-steps small,
@@ -735,6 +739,19 @@
   margin: 0;
   color: var(--muted);
   font-size: 0.9rem;
+}
+
+.amap-navigation-card__substatus {
+  font-size: 0.84rem;
+}
+
+.amap-navigation-card__warning {
+  border: 1px solid rgba(238, 150, 52, 0.24);
+  border-radius: 16px;
+  padding: 0.72rem 0.82rem;
+  background: rgba(255, 248, 236, 0.78);
+  color: #8a560c;
+  font-weight: 700;
 }
 
 .live-navigation-badge {
@@ -783,7 +800,7 @@
 
 .amap-navigation-metrics {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 0.65rem;
 }
 

@@ -9,6 +9,16 @@ declare global {
       serviceHost?: string
     }
   }
+
+  interface DeviceOrientationEvent {
+    webkitCompassHeading?: number
+  }
+}
+
+type DeviceOrientationPermissionState = 'granted' | 'denied' | 'prompt'
+
+type DeviceOrientationEventConstructorWithPermission = typeof DeviceOrientationEvent & {
+  requestPermission?: () => Promise<DeviceOrientationPermissionState>
 }
 
 type LngLatTuple = [number, number]
@@ -41,6 +51,11 @@ interface AmapWalkingRoute {
 
 interface AmapWalkingResult {
   routes?: AmapWalkingRoute[]
+}
+
+interface AmapConvertResult {
+  locations?: unknown[]
+  info?: string
 }
 
 interface AmapMarkerInstance {
@@ -83,12 +98,24 @@ interface AmapNamespace {
   PlaceSearch: new (options?: Record<string, unknown>) => AmapPlaceSearchInstance
   Walking: new (options?: Record<string, unknown>) => AmapWalkingInstance
   Marker: new (options?: Record<string, unknown>) => AmapMarkerInstance
+  convertFrom?: (
+    position: LngLatTuple,
+    type: string,
+    callback: (status: string, result: AmapConvertResult) => void,
+  ) => void
 }
 
-interface BrowserLocation {
+interface RawBrowserLocation {
   coords: LngLatTuple
   accuracy: number
+  heading: number | null
+  speed: number | null
   timestamp: number
+}
+
+interface BrowserLocation extends RawBrowserLocation {
+  rawCoords: LngLatTuple
+  coordinateSystem: 'gcj02' | 'wgs84'
 }
 
 interface LiveNavigationStep {
@@ -114,6 +141,8 @@ const STEP_ADVANCE_DISTANCE_METERS = 30
 const ARRIVAL_DISTANCE_METERS = 25
 const ROUTE_DEVIATION_DISTANCE_METERS = 75
 const REROUTE_COOLDOWN_MS = 15_000
+const GOOD_ACCURACY_METERS = 35
+const USABLE_ACCURACY_METERS = 120
 
 interface AmapLiveMapProps {
   campus: CampusConfig
@@ -282,6 +311,62 @@ function getGeolocationErrorMessage(error: GeolocationPositionError) {
   return '暂时无法获取当前位置，请确认 GPS、网络和定位权限可用。'
 }
 
+function normalizeHeading(degrees: number) {
+  return ((degrees % 360) + 360) % 360
+}
+
+function getScreenOrientationAngle() {
+  const orientation = window.screen?.orientation
+
+  if (orientation && typeof orientation.angle === 'number') {
+    return orientation.angle
+  }
+
+  const legacyOrientation = (window as { orientation?: unknown }).orientation
+
+  return typeof legacyOrientation === 'number' ? legacyOrientation : 0
+}
+
+function getCompassHeading(event: DeviceOrientationEvent) {
+  if (typeof event.webkitCompassHeading === 'number') {
+    return normalizeHeading(event.webkitCompassHeading)
+  }
+
+  if (typeof event.alpha !== 'number') {
+    return null
+  }
+
+  return normalizeHeading(360 - event.alpha + getScreenOrientationAngle())
+}
+
+function getPositionHeading(position: GeolocationPosition) {
+  return typeof position.coords.heading === 'number' && Number.isFinite(position.coords.heading)
+    ? normalizeHeading(position.coords.heading)
+    : null
+}
+
+function getPositionSpeed(position: GeolocationPosition) {
+  return typeof position.coords.speed === 'number' && Number.isFinite(position.coords.speed)
+    ? position.coords.speed
+    : null
+}
+
+function getAccuracyMessage(location: BrowserLocation) {
+  if (location.coordinateSystem === 'wgs84') {
+    return '当前位置已获取，但高德坐标转换失败，地图上可能仍有偏移。'
+  }
+
+  if (location.accuracy > USABLE_ACCURACY_METERS) {
+    return `当前定位精度约 ${Math.round(location.accuracy)} 米，偏差较大；请到室外开阔区域后再开始导航。`
+  }
+
+  if (location.accuracy > GOOD_ACCURACY_METERS) {
+    return `当前定位精度约 ${Math.round(location.accuracy)} 米，可用但不适合精确路口判断。`
+  }
+
+  return ''
+}
+
 function getStepEndPoint(step: LiveNavigationStep) {
   return step.path.at(-1) ?? null
 }
@@ -326,27 +411,67 @@ function normalizeWalkingRoute(
   } satisfies LiveNavigationRoute
 }
 
-function toBrowserLocation(position: GeolocationPosition): BrowserLocation {
+function toRawBrowserLocation(position: GeolocationPosition): RawBrowserLocation {
   return {
     coords: [position.coords.longitude, position.coords.latitude],
     accuracy: position.coords.accuracy,
+    heading: getPositionHeading(position),
+    speed: getPositionSpeed(position),
     timestamp: position.timestamp,
   }
 }
 
-function requestBrowserLocation() {
-  return new Promise<BrowserLocation>((resolve, reject) => {
+function requestRawBrowserLocation() {
+  return new Promise<RawBrowserLocation>((resolve, reject) => {
     if (!navigator.geolocation) {
       reject(new Error('当前浏览器不支持实时定位。'))
       return
     }
 
-    navigator.geolocation.getCurrentPosition(
-      (position) => resolve(toBrowserLocation(position)),
-      (error) => reject(new Error(getGeolocationErrorMessage(error))),
+    let bestLocation: RawBrowserLocation | null = null
+    let lastError: GeolocationPositionError | null = null
+    let settled = false
+
+    const finish = (location: RawBrowserLocation | null) => {
+      if (settled) {
+        return
+      }
+
+      settled = true
+      window.clearTimeout(timeoutId)
+      navigator.geolocation.clearWatch(watchId)
+
+      if (location) {
+        resolve(location)
+        return
+      }
+
+      reject(new Error(lastError ? getGeolocationErrorMessage(lastError) : '暂时无法获取当前位置。'))
+    }
+
+    const timeoutId = window.setTimeout(() => finish(bestLocation), 14_000)
+    const watchId = navigator.geolocation.watchPosition(
+      (position) => {
+        const nextLocation = toRawBrowserLocation(position)
+
+        if (!bestLocation || nextLocation.accuracy < bestLocation.accuracy) {
+          bestLocation = nextLocation
+        }
+
+        if (nextLocation.accuracy <= GOOD_ACCURACY_METERS) {
+          finish(nextLocation)
+        }
+      },
+      (error) => {
+        lastError = error
+
+        if (error.code === error.PERMISSION_DENIED) {
+          finish(null)
+        }
+      },
       {
         enableHighAccuracy: true,
-        maximumAge: 2_000,
+        maximumAge: 0,
         timeout: 12_000,
       },
     )
@@ -370,11 +495,15 @@ export function AmapLiveMap({
   const campusCenterRef = useRef<LngLatTuple>(DEFAULT_CENTER)
   const placeCacheRef = useRef(new Map<string, LngLatTuple>())
   const userMarkerRef = useRef<AmapMarkerInstance | null>(null)
+  const userMarkerElementRef = useRef<HTMLDivElement | null>(null)
   const destinationMarkerRef = useRef<AmapMarkerInstance | null>(null)
   const watchIdRef = useRef<number | null>(null)
   const liveRouteRef = useRef<LiveNavigationRoute | null>(null)
   const currentStepIndexRef = useRef(0)
   const voiceEnabledRef = useRef(true)
+  const headingDegreesRef = useRef<number | null>(null)
+  const isHeadingTrackingRef = useRef(false)
+  const orientationHandlerRef = useRef<((event: DeviceOrientationEvent) => void) | null>(null)
   const isNavigatingRef = useRef(false)
   const isReplanningRef = useRef(false)
   const destinationLocationRef = useRef<LngLatTuple | null>(null)
@@ -387,6 +516,10 @@ export function AmapLiveMap({
   const [isNavigating, setIsNavigating] = useState(false)
   const [isReplanning, setIsReplanning] = useState(false)
   const [voiceEnabled, setVoiceEnabled] = useState(true)
+  const [voiceStatus, setVoiceStatus] = useState('语音需要在手机上点击按钮后解锁。')
+  const [headingDegrees, setHeadingDegrees] = useState<number | null>(null)
+  const [headingStatus, setHeadingStatus] = useState('方向传感器尚未启用。')
+  const [locationWarning, setLocationWarning] = useState('')
   const [navigationStatus, setNavigationStatus] = useState('选择终点后，可从当前位置开始实时导航。')
   const [navigationError, setNavigationError] = useState('')
   const [currentLocation, setCurrentLocation] = useState<BrowserLocation | null>(null)
@@ -416,6 +549,14 @@ export function AmapLiveMap({
   }, [voiceEnabled])
 
   useEffect(() => {
+    headingDegreesRef.current = headingDegrees
+
+    if (headingDegrees !== null) {
+      updateUserMarkerHeading(headingDegrees)
+    }
+  }, [headingDegrees])
+
+  useEffect(() => {
     isNavigatingRef.current = isNavigating
   }, [isNavigating])
 
@@ -423,12 +564,54 @@ export function AmapLiveMap({
     navigationTargetRef.current = navigationTargetPlace
   }, [navigationTargetPlace])
 
+  function createSpeechUtterance(text: string) {
+    const utterance = new SpeechSynthesisUtterance(text)
+    const voices = window.speechSynthesis.getVoices()
+    const chineseVoice =
+      voices.find((voice) => voice.lang.toLowerCase() === 'zh-cn') ??
+      voices.find((voice) => voice.lang.toLowerCase().startsWith('zh')) ??
+      null
+
+    if (chineseVoice) {
+      utterance.voice = chineseVoice
+    }
+
+    utterance.lang = chineseVoice?.lang ?? 'zh-CN'
+    utterance.rate = 1
+    utterance.pitch = 1
+    utterance.volume = 1
+    utterance.onstart = () => setVoiceStatus('正在语音播报。')
+    utterance.onend = () => setVoiceStatus('语音已就绪。')
+    utterance.onerror = () => {
+      setVoiceStatus('语音被当前浏览器拦截或系统无可用中文语音，请点击“开启语音”并检查媒体音量。')
+    }
+
+    return utterance
+  }
+
+  function canUseSpeech() {
+    return 'speechSynthesis' in window && typeof SpeechSynthesisUtterance !== 'undefined'
+  }
+
+  function primeSpeechEngine(text = '语音导航已开启') {
+    if (!canUseSpeech()) {
+      setVoiceStatus('当前浏览器不支持网页语音播报。')
+      return false
+    }
+
+    window.speechSynthesis.cancel()
+    window.speechSynthesis.resume()
+    window.speechSynthesis.speak(createSpeechUtterance(text))
+    lastSpokenTextRef.current = text
+    setVoiceStatus('已请求语音播放；如果没声音，请检查媒体音量或浏览器语音权限。')
+    return true
+  }
+
   function speak(text: string, force = false) {
     if (
       !voiceEnabledRef.current ||
       !text ||
-      !('speechSynthesis' in window) ||
-      typeof SpeechSynthesisUtterance === 'undefined'
+      !canUseSpeech()
     ) {
       return
     }
@@ -438,12 +621,80 @@ export function AmapLiveMap({
     }
 
     window.speechSynthesis.cancel()
-    const utterance = new SpeechSynthesisUtterance(text)
-    utterance.lang = 'zh-CN'
-    utterance.rate = 1.02
-    utterance.pitch = 1
-    window.speechSynthesis.speak(utterance)
+    window.speechSynthesis.resume()
+    window.speechSynthesis.speak(createSpeechUtterance(text))
     lastSpokenTextRef.current = text
+  }
+
+  function updateUserMarkerHeading(heading: number | null) {
+    if (heading === null) {
+      return
+    }
+
+    userMarkerElementRef.current?.style.setProperty('--heading', `${normalizeHeading(heading)}deg`)
+  }
+
+  function handleDeviceOrientation(event: DeviceOrientationEvent) {
+    const nextHeading = getCompassHeading(event)
+
+    if (nextHeading === null) {
+      return
+    }
+
+    headingDegreesRef.current = nextHeading
+    setHeadingDegrees(nextHeading)
+    setHeadingStatus(`方向传感器已启用：${Math.round(nextHeading)}°。`)
+    updateUserMarkerHeading(nextHeading)
+  }
+
+  async function startHeadingTracking() {
+    if (isHeadingTrackingRef.current) {
+      return true
+    }
+
+    const orientationConstructor = window.DeviceOrientationEvent as
+      | DeviceOrientationEventConstructorWithPermission
+      | undefined
+
+    if (!orientationConstructor) {
+      setHeadingStatus('当前浏览器不支持方向传感器，箭头只能使用步行方向估计。')
+      return false
+    }
+
+    try {
+      if (typeof orientationConstructor.requestPermission === 'function') {
+        const permission = await orientationConstructor.requestPermission()
+
+        if (permission !== 'granted') {
+          setHeadingStatus('方向传感器权限未授权，箭头无法随手机转动。')
+          return false
+        }
+      }
+
+      orientationHandlerRef.current = (event) => handleDeviceOrientation(event)
+      window.addEventListener('deviceorientationabsolute', orientationHandlerRef.current, true)
+      window.addEventListener('deviceorientation', orientationHandlerRef.current, true)
+      isHeadingTrackingRef.current = true
+      setHeadingStatus('方向传感器已启用，转动手机时箭头会同步旋转。')
+      return true
+    } catch {
+      setHeadingStatus('方向传感器启动失败，请在浏览器权限中允许运动与方向访问。')
+      return false
+    }
+  }
+
+  function stopHeadingTracking() {
+    if (!isHeadingTrackingRef.current) {
+      return
+    }
+
+    if (orientationHandlerRef.current) {
+      window.removeEventListener('deviceorientationabsolute', orientationHandlerRef.current, true)
+      window.removeEventListener('deviceorientation', orientationHandlerRef.current, true)
+      orientationHandlerRef.current = null
+    }
+
+    isHeadingTrackingRef.current = false
   }
 
   function clearSceneOverlays() {
@@ -456,6 +707,7 @@ export function AmapLiveMap({
     userMarkerRef.current?.setMap(null)
     destinationMarkerRef.current?.setMap(null)
     userMarkerRef.current = null
+    userMarkerElementRef.current = null
     destinationMarkerRef.current = null
   }
 
@@ -493,14 +745,21 @@ export function AmapLiveMap({
 
     if (userMarkerRef.current?.setPosition) {
       userMarkerRef.current.setPosition(location.coords)
+      updateUserMarkerHeading(headingDegreesRef.current ?? location.heading)
       return
     }
+
+    const markerContent = document.createElement('div')
+    markerContent.className = 'amap-user-marker'
+    markerContent.innerHTML = '<span class="amap-user-marker__arrow"></span>'
+    userMarkerElementRef.current = markerContent
+    updateUserMarkerHeading(headingDegreesRef.current ?? location.heading)
 
     const marker = new AMap.Marker({
       position: location.coords,
       title: '当前位置',
       zIndex: 120,
-      content: '<div class="amap-user-marker"><span></span></div>',
+      content: markerContent,
     })
 
     userMarkerRef.current = marker
@@ -575,6 +834,43 @@ export function AmapLiveMap({
     return null
   }
 
+  async function convertRawLocationToAmap(rawLocation: RawBrowserLocation): Promise<BrowserLocation> {
+    const AMap = AMapRef.current
+
+    if (!AMap?.convertFrom) {
+      return {
+        ...rawLocation,
+        rawCoords: rawLocation.coords,
+        coordinateSystem: 'wgs84',
+      }
+    }
+
+    return await new Promise<BrowserLocation>((resolve) => {
+      AMap.convertFrom?.(rawLocation.coords, 'gps', (convertStatus, result) => {
+        const convertedLocation =
+          convertStatus === 'complete' ? toLngLatTuple(result.locations?.[0]) : null
+
+        resolve({
+          ...rawLocation,
+          coords: convertedLocation ?? rawLocation.coords,
+          rawCoords: rawLocation.coords,
+          coordinateSystem: convertedLocation ? 'gcj02' : 'wgs84',
+        })
+      })
+    })
+  }
+
+  function applyLocationDiagnostics(location: BrowserLocation) {
+    setLocationWarning(getAccuracyMessage(location))
+
+    if (headingDegreesRef.current === null && location.heading !== null) {
+      headingDegreesRef.current = location.heading
+      setHeadingDegrees(location.heading)
+      updateUserMarkerHeading(location.heading)
+      setHeadingStatus(`使用 GPS 步行方向估计箭头：${Math.round(location.heading)}°。`)
+    }
+  }
+
   async function rebuildRouteFromPosition(
     location: BrowserLocation,
     targetPlace: PlaceRecord,
@@ -625,6 +921,7 @@ export function AmapLiveMap({
 
   async function handleNavigationPosition(location: BrowserLocation) {
     setCurrentLocation(location)
+    applyLocationDiagnostics(location)
     updateUserMarker(location)
     mapRef.current?.setCenter(location.coords)
 
@@ -668,11 +965,15 @@ export function AmapLiveMap({
     }
 
     const routeDistance = distanceToPathMeters(location.coords, route.path)
+    const deviationThreshold = Math.max(
+      ROUTE_DEVIATION_DISTANCE_METERS,
+      Math.round(location.accuracy * 1.5),
+    )
     const now = Date.now()
 
     if (
       route.path.length &&
-      routeDistance > ROUTE_DEVIATION_DISTANCE_METERS &&
+      routeDistance > deviationThreshold &&
       now - lastRerouteAtRef.current > REROUTE_COOLDOWN_MS &&
       !isReplanningRef.current
     ) {
@@ -714,16 +1015,21 @@ export function AmapLiveMap({
     setCurrentStepIndex(0)
     currentStepIndexRef.current = 0
     lastSpokenTextRef.current = ''
+    setLocationWarning('')
     setNavigationStatus('正在获取当前位置，请允许浏览器使用定位。')
+    primeSpeechEngine('语音导航已开启，正在获取当前位置。')
+    void startHeadingTracking()
 
     try {
-      const location = await requestBrowserLocation()
+      const rawLocation = await requestRawBrowserLocation()
+      const location = await convertRawLocationToAmap(rawLocation)
 
       if (!isNavigatingRef.current) {
         return
       }
 
       setCurrentLocation(location)
+      applyLocationDiagnostics(location)
       updateUserMarker(location)
       const destinationLocation = await resolvePlaceLocation(navigationTargetPlace)
 
@@ -737,7 +1043,9 @@ export function AmapLiveMap({
 
       watchIdRef.current = navigator.geolocation.watchPosition(
         (position) => {
-          void handleNavigationPosition(toBrowserLocation(position))
+          void convertRawLocationToAmap(toRawBrowserLocation(position)).then((nextLocation) => {
+            void handleNavigationPosition(nextLocation)
+          })
         },
         (nextError) => {
           const message = getGeolocationErrorMessage(nextError)
@@ -766,6 +1074,7 @@ export function AmapLiveMap({
     }
 
     window.speechSynthesis?.cancel()
+    stopHeadingTracking()
     isNavigatingRef.current = false
     isReplanningRef.current = false
     setIsNavigating(false)
@@ -775,6 +1084,9 @@ export function AmapLiveMap({
     liveRouteRef.current = null
     setCurrentStepIndex(0)
     currentStepIndexRef.current = 0
+    setHeadingDegrees(null)
+    headingDegreesRef.current = null
+    setLocationWarning('')
     destinationLocationRef.current = null
     walkingRef.current?.clear?.()
     clearNavigationMarkers()
@@ -787,10 +1099,11 @@ export function AmapLiveMap({
 
     if (!nextVoiceState) {
       window.speechSynthesis?.cancel()
+      setVoiceStatus('语音已关闭。')
       return
     }
 
-    speak(currentInstruction || navigationStatus, true)
+    primeSpeechEngine(currentInstruction || '语音导航已开启。')
   }
 
   useEffect(() => {
@@ -1070,6 +1383,9 @@ export function AmapLiveMap({
         <p className="amap-navigation-card__status" aria-live="polite">
           {navigationStatus}
         </p>
+        <p className="amap-navigation-card__substatus">{headingStatus}</p>
+        <p className="amap-navigation-card__substatus">{voiceStatus}</p>
+        {locationWarning ? <p className="amap-navigation-card__warning">{locationWarning}</p> : null}
         {navigationError ? <p className="amap-panel__error">{navigationError}</p> : null}
 
         <div className="amap-navigation-metrics">
@@ -1084,6 +1400,16 @@ export function AmapLiveMap({
           <div>
             <span>定位精度</span>
             <strong>{currentLocation ? `约 ${Math.round(currentLocation.accuracy)} 米` : '未定位'}</strong>
+          </div>
+          <div>
+            <span>箭头方向</span>
+            <strong>
+              {headingDegrees !== null
+                ? `${Math.round(headingDegrees)}°`
+                : currentLocation?.heading !== null && currentLocation?.heading !== undefined
+                  ? `${Math.round(currentLocation.heading)}°`
+                  : '未获取'}
+            </strong>
           </div>
         </div>
 
