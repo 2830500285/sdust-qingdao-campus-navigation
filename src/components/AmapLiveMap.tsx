@@ -23,12 +23,29 @@ interface AmapPoiResult {
   }
 }
 
+interface AmapWalkingStep {
+  instruction?: string
+  distance?: number
+  time?: number
+  path?: unknown[]
+  road?: string
+  action?: string
+  assist_action?: string
+}
+
+interface AmapWalkingRoute {
+  distance?: number
+  time?: number
+  steps?: AmapWalkingStep[]
+}
+
 interface AmapWalkingResult {
-  routes?: unknown[]
+  routes?: AmapWalkingRoute[]
 }
 
 interface AmapMarkerInstance {
   setMap: (map: AmapMapInstance | null) => void
+  setPosition?: (position: LngLatTuple) => void
 }
 
 interface AmapPlaceSearchInstance {
@@ -42,7 +59,7 @@ interface AmapWalkingInstance {
   search: (
     start: LngLatTuple,
     end: LngLatTuple,
-    callback: (status: string, result: AmapWalkingResult) => void,
+    callback: (status: string, result: AmapWalkingResult | string) => void,
   ) => void
   clear?: () => void
 }
@@ -68,9 +85,35 @@ interface AmapNamespace {
   Marker: new (options?: Record<string, unknown>) => AmapMarkerInstance
 }
 
+interface BrowserLocation {
+  coords: LngLatTuple
+  accuracy: number
+  timestamp: number
+}
+
+interface LiveNavigationStep {
+  instruction: string
+  distanceMeters: number
+  timeSeconds: number
+  path: LngLatTuple[]
+}
+
+interface LiveNavigationRoute {
+  destinationPlaceId: string
+  destinationName: string
+  distanceMeters: number
+  timeSeconds: number
+  path: LngLatTuple[]
+  steps: LiveNavigationStep[]
+}
+
 const DEFAULT_CENTER: LngLatTuple = [120.12043, 36.001796]
 const DEFAULT_ZOOM = 16
 const CAMPUS_MAX_DISTANCE_METERS = 3200
+const STEP_ADVANCE_DISTANCE_METERS = 30
+const ARRIVAL_DISTANCE_METERS = 25
+const ROUTE_DEVIATION_DISTANCE_METERS = 75
+const REROUTE_COOLDOWN_MS = 15_000
 
 interface AmapLiveMapProps {
   campus: CampusConfig
@@ -91,15 +134,34 @@ function toLngLatTuple(value: unknown): LngLatTuple | null {
     return [value[0], value[1]]
   }
 
-  if (
-    value &&
-    typeof value === 'object' &&
-    'lng' in value &&
-    'lat' in value &&
-    typeof value.lng === 'number' &&
-    typeof value.lat === 'number'
-  ) {
-    return [value.lng, value.lat]
+  if (typeof value === 'string') {
+    const [lng, lat] = value.split(',').map((item) => Number(item.trim()))
+
+    if (Number.isFinite(lng) && Number.isFinite(lat)) {
+      return [lng, lat]
+    }
+  }
+
+  if (value && typeof value === 'object') {
+    const record = value as {
+      lng?: unknown
+      lat?: unknown
+      getLng?: unknown
+      getLat?: unknown
+    }
+
+    if (typeof record.lng === 'number' && typeof record.lat === 'number') {
+      return [record.lng, record.lat]
+    }
+
+    if (typeof record.getLng === 'function' && typeof record.getLat === 'function') {
+      const lng = record.getLng()
+      const lat = record.getLat()
+
+      if (typeof lng === 'number' && typeof lat === 'number') {
+        return [lng, lat]
+      }
+    }
   }
 
   return null
@@ -118,6 +180,51 @@ function haversineDistance(from: LngLatTuple, to: LngLatTuple) {
     Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLng / 2) ** 2
 
   return 2 * earthRadius * Math.asin(Math.sqrt(a))
+}
+
+function distanceToSegmentMeters(point: LngLatTuple, start: LngLatTuple, end: LngLatTuple) {
+  const metersPerDegreeLat = 110_540
+  const metersPerDegreeLng = 111_320 * Math.cos((point[1] * Math.PI) / 180)
+  const px = point[0] * metersPerDegreeLng
+  const py = point[1] * metersPerDegreeLat
+  const sx = start[0] * metersPerDegreeLng
+  const sy = start[1] * metersPerDegreeLat
+  const ex = end[0] * metersPerDegreeLng
+  const ey = end[1] * metersPerDegreeLat
+  const dx = ex - sx
+  const dy = ey - sy
+  const segmentLengthSquared = dx * dx + dy * dy
+
+  if (segmentLengthSquared === 0) {
+    return haversineDistance(point, start)
+  }
+
+  const projection = Math.max(0, Math.min(1, ((px - sx) * dx + (py - sy) * dy) / segmentLengthSquared))
+  const nearestX = sx + projection * dx
+  const nearestY = sy + projection * dy
+
+  return Math.hypot(px - nearestX, py - nearestY)
+}
+
+function distanceToPathMeters(point: LngLatTuple, path: LngLatTuple[]) {
+  if (!path.length) {
+    return Number.POSITIVE_INFINITY
+  }
+
+  if (path.length === 1) {
+    return haversineDistance(point, path[0])
+  }
+
+  let nearestDistance = Number.POSITIVE_INFINITY
+
+  for (let index = 1; index < path.length; index += 1) {
+    nearestDistance = Math.min(
+      nearestDistance,
+      distanceToSegmentMeters(point, path[index - 1], path[index]),
+    )
+  }
+
+  return nearestDistance
 }
 
 function getCampusQueries(campus: CampusConfig) {
@@ -143,6 +250,109 @@ function getPlaceQueries(campus: CampusConfig, place: PlaceRecord) {
   return Array.from(new Set(candidates.map((value) => value.trim()).filter(Boolean)))
 }
 
+function formatDistance(distanceMeters: number) {
+  if (!Number.isFinite(distanceMeters)) {
+    return '未知'
+  }
+
+  if (distanceMeters >= 1000) {
+    return `${(distanceMeters / 1000).toFixed(1)} 公里`
+  }
+
+  return `${Math.max(0, Math.round(distanceMeters))} 米`
+}
+
+function formatDuration(timeSeconds: number) {
+  if (!Number.isFinite(timeSeconds) || timeSeconds <= 0) {
+    return '未知'
+  }
+
+  return `${Math.max(1, Math.round(timeSeconds / 60))} 分钟`
+}
+
+function getGeolocationErrorMessage(error: GeolocationPositionError) {
+  if (error.code === error.PERMISSION_DENIED) {
+    return '定位权限被拒绝，请在浏览器或手机系统设置中允许本网站使用定位。'
+  }
+
+  if (error.code === error.TIMEOUT) {
+    return '定位超时，请移动到室外或网络更稳定的位置后重试。'
+  }
+
+  return '暂时无法获取当前位置，请确认 GPS、网络和定位权限可用。'
+}
+
+function getStepEndPoint(step: LiveNavigationStep) {
+  return step.path.at(-1) ?? null
+}
+
+function normalizeWalkingRoute(
+  route: AmapWalkingRoute,
+  destinationPlaceId: string,
+  destinationName: string,
+) {
+  const steps: LiveNavigationStep[] = (route.steps ?? [])
+    .map((step, index) => {
+      const path = (step.path ?? [])
+        .map((point) => toLngLatTuple(point))
+        .filter((point): point is LngLatTuple => point !== null)
+      const distanceMeters = Number.isFinite(step.distance) ? Number(step.distance) : 0
+      const timeSeconds = Number.isFinite(step.time) ? Number(step.time) : 0
+
+      return {
+        instruction: step.instruction?.trim() || step.action?.trim() || `继续前往第 ${index + 1} 段路线`,
+        distanceMeters: Math.max(0, Math.round(distanceMeters)),
+        timeSeconds: Math.max(0, Math.round(timeSeconds)),
+        path,
+      }
+    })
+    .filter((step) => step.instruction || step.path.length)
+
+  const path = steps.flatMap((step) => step.path)
+  const routeDistance = Number.isFinite(route.distance)
+    ? Number(route.distance)
+    : steps.reduce((sum, step) => sum + step.distanceMeters, 0)
+  const routeTime = Number.isFinite(route.time)
+    ? Number(route.time)
+    : steps.reduce((sum, step) => sum + step.timeSeconds, 0)
+
+  return {
+    destinationPlaceId,
+    destinationName,
+    distanceMeters: Math.max(0, Math.round(routeDistance)),
+    timeSeconds: Math.max(0, Math.round(routeTime)),
+    path,
+    steps,
+  } satisfies LiveNavigationRoute
+}
+
+function toBrowserLocation(position: GeolocationPosition): BrowserLocation {
+  return {
+    coords: [position.coords.longitude, position.coords.latitude],
+    accuracy: position.coords.accuracy,
+    timestamp: position.timestamp,
+  }
+}
+
+function requestBrowserLocation() {
+  return new Promise<BrowserLocation>((resolve, reject) => {
+    if (!navigator.geolocation) {
+      reject(new Error('当前浏览器不支持实时定位。'))
+      return
+    }
+
+    navigator.geolocation.getCurrentPosition(
+      (position) => resolve(toBrowserLocation(position)),
+      (error) => reject(new Error(getGeolocationErrorMessage(error))),
+      {
+        enableHighAccuracy: true,
+        maximumAge: 2_000,
+        timeout: 12_000,
+      },
+    )
+  })
+}
+
 export function AmapLiveMap({
   campus,
   endPlaceId,
@@ -156,16 +366,432 @@ export function AmapLiveMap({
   const AMapRef = useRef<AmapNamespace | null>(null)
   const placeSearchRef = useRef<AmapPlaceSearchInstance | null>(null)
   const walkingRef = useRef<AmapWalkingInstance | null>(null)
-  const overlaysRef = useRef<AmapMarkerInstance[]>([])
+  const sceneOverlaysRef = useRef<AmapMarkerInstance[]>([])
   const campusCenterRef = useRef<LngLatTuple>(DEFAULT_CENTER)
   const placeCacheRef = useRef(new Map<string, LngLatTuple>())
+  const userMarkerRef = useRef<AmapMarkerInstance | null>(null)
+  const destinationMarkerRef = useRef<AmapMarkerInstance | null>(null)
+  const watchIdRef = useRef<number | null>(null)
+  const liveRouteRef = useRef<LiveNavigationRoute | null>(null)
+  const currentStepIndexRef = useRef(0)
+  const voiceEnabledRef = useRef(true)
+  const isNavigatingRef = useRef(false)
+  const isReplanningRef = useRef(false)
+  const destinationLocationRef = useRef<LngLatTuple | null>(null)
+  const navigationTargetRef = useRef<PlaceRecord | null>(null)
+  const lastRerouteAtRef = useRef(0)
+  const lastSpokenTextRef = useRef('')
   const [status, setStatus] = useState('正在等待高德实景地图初始化。')
   const [error, setError] = useState('')
+  const [isMapReady, setIsMapReady] = useState(false)
+  const [isNavigating, setIsNavigating] = useState(false)
+  const [isReplanning, setIsReplanning] = useState(false)
+  const [voiceEnabled, setVoiceEnabled] = useState(true)
+  const [navigationStatus, setNavigationStatus] = useState('选择终点后，可从当前位置开始实时导航。')
+  const [navigationError, setNavigationError] = useState('')
+  const [currentLocation, setCurrentLocation] = useState<BrowserLocation | null>(null)
+  const [liveRoute, setLiveRoute] = useState<LiveNavigationRoute | null>(null)
+  const [currentStepIndex, setCurrentStepIndex] = useState(0)
 
   const keyedPlaces = useMemo(
     () => Object.fromEntries(places.map((place) => [place.id, place])),
     [places],
   )
+  const selectedPlace = keyedPlaces[selectedPlaceId] ?? null
+  const endPlace = keyedPlaces[endPlaceId] ?? null
+  const navigationTargetPlace = endPlace ?? selectedPlace
+  const currentInstruction = liveRoute?.steps[currentStepIndex]?.instruction ?? ''
+  const remainingSteps = liveRoute?.steps.slice(currentStepIndex, currentStepIndex + 3) ?? []
+
+  useEffect(() => {
+    liveRouteRef.current = liveRoute
+  }, [liveRoute])
+
+  useEffect(() => {
+    currentStepIndexRef.current = currentStepIndex
+  }, [currentStepIndex])
+
+  useEffect(() => {
+    voiceEnabledRef.current = voiceEnabled
+  }, [voiceEnabled])
+
+  useEffect(() => {
+    isNavigatingRef.current = isNavigating
+  }, [isNavigating])
+
+  useEffect(() => {
+    navigationTargetRef.current = navigationTargetPlace
+  }, [navigationTargetPlace])
+
+  function speak(text: string, force = false) {
+    if (
+      !voiceEnabledRef.current ||
+      !text ||
+      !('speechSynthesis' in window) ||
+      typeof SpeechSynthesisUtterance === 'undefined'
+    ) {
+      return
+    }
+
+    if (!force && lastSpokenTextRef.current === text) {
+      return
+    }
+
+    window.speechSynthesis.cancel()
+    const utterance = new SpeechSynthesisUtterance(text)
+    utterance.lang = 'zh-CN'
+    utterance.rate = 1.02
+    utterance.pitch = 1
+    window.speechSynthesis.speak(utterance)
+    lastSpokenTextRef.current = text
+  }
+
+  function clearSceneOverlays() {
+    sceneOverlaysRef.current.forEach((overlay) => overlay?.setMap?.(null))
+    sceneOverlaysRef.current = []
+    walkingRef.current?.clear?.()
+  }
+
+  function clearNavigationMarkers() {
+    userMarkerRef.current?.setMap(null)
+    destinationMarkerRef.current?.setMap(null)
+    userMarkerRef.current = null
+    destinationMarkerRef.current = null
+  }
+
+  function addMarker(
+    position: LngLatTuple,
+    title: string,
+    labelClassName = 'amap-live-label',
+    labelPrefix = '',
+  ) {
+    const AMap = AMapRef.current
+
+    if (!AMap || !mapRef.current) {
+      return
+    }
+
+    const marker = new AMap.Marker({
+      position,
+      title,
+      label: {
+        content: `<div class="${labelClassName}">${labelPrefix}${title}</div>`,
+      },
+    })
+
+    sceneOverlaysRef.current.push(marker)
+    marker.setMap(mapRef.current)
+  }
+
+  function updateUserMarker(location: BrowserLocation) {
+    const map = mapRef.current
+    const AMap = AMapRef.current
+
+    if (!map || !AMap) {
+      return
+    }
+
+    if (userMarkerRef.current?.setPosition) {
+      userMarkerRef.current.setPosition(location.coords)
+      return
+    }
+
+    const marker = new AMap.Marker({
+      position: location.coords,
+      title: '当前位置',
+      zIndex: 120,
+      content: '<div class="amap-user-marker"><span></span></div>',
+    })
+
+    userMarkerRef.current = marker
+    marker.setMap(map)
+  }
+
+  function setDestinationMarker(position: LngLatTuple, title: string) {
+    const map = mapRef.current
+    const AMap = AMapRef.current
+
+    if (!map || !AMap) {
+      return
+    }
+
+    destinationMarkerRef.current?.setMap(null)
+    destinationMarkerRef.current = new AMap.Marker({
+      position,
+      title,
+      zIndex: 110,
+      label: {
+        content: `<div class="amap-live-label amap-live-label--end">终 ${title}</div>`,
+      },
+    })
+    destinationMarkerRef.current.setMap(map)
+  }
+
+  async function searchKeyword(keyword: string) {
+    return await new Promise<AmapPoiRecord[]>((resolve) => {
+      placeSearchRef.current?.search(keyword, (searchStatus: string, result: AmapPoiResult) => {
+        if (searchStatus !== 'complete' || !result?.poiList?.pois?.length) {
+          resolve([])
+          return
+        }
+
+        resolve(result.poiList.pois)
+      })
+    })
+  }
+
+  async function resolvePlaceLocation(place: PlaceRecord) {
+    const cached = placeCacheRef.current.get(place.id)
+
+    if (cached) {
+      return cached
+    }
+
+    for (const query of getPlaceQueries(campus, place)) {
+      const pois = await searchKeyword(query)
+      const candidates = pois
+        .map((poi) => toLngLatTuple(poi.location))
+        .filter((value): value is LngLatTuple => value !== null)
+
+      if (!candidates.length) {
+        continue
+      }
+
+      const nearby = candidates
+        .map((candidate) => ({
+          candidate,
+          distance: haversineDistance(campusCenterRef.current, candidate),
+        }))
+        .sort((left, right) => left.distance - right.distance)
+
+      const bestCandidate =
+        nearby.find((item) => item.distance <= CAMPUS_MAX_DISTANCE_METERS)?.candidate ??
+        candidates[0]
+
+      placeCacheRef.current.set(place.id, bestCandidate)
+      return bestCandidate
+    }
+
+    return null
+  }
+
+  async function rebuildRouteFromPosition(
+    location: BrowserLocation,
+    targetPlace: PlaceRecord,
+    destinationLocation: LngLatTuple,
+    reason: 'start' | 'reroute',
+  ) {
+    if (!walkingRef.current) {
+      throw new Error('高德步行规划尚未初始化。')
+    }
+
+    isReplanningRef.current = true
+    setIsReplanning(true)
+
+    try {
+      walkingRef.current.clear?.()
+
+      const nextRoute = await new Promise<LiveNavigationRoute>((resolve, reject) => {
+        walkingRef.current?.search(location.coords, destinationLocation, (searchStatus, result) => {
+          if (searchStatus !== 'complete' || typeof result === 'string' || !result.routes?.length) {
+            reject(new Error('高德地图未返回可用步行路线，请稍后重试或改用路网示意。'))
+            return
+          }
+
+          resolve(normalizeWalkingRoute(result.routes[0], targetPlace.id, targetPlace.name))
+        })
+      })
+
+      if (!isNavigatingRef.current) {
+        return
+      }
+
+      setLiveRoute(nextRoute)
+      liveRouteRef.current = nextRoute
+      setCurrentStepIndex(0)
+      currentStepIndexRef.current = 0
+      const nextInstruction = nextRoute.steps[0]?.instruction ?? `向 ${targetPlace.name} 前进`
+      setNavigationStatus(
+        reason === 'reroute'
+          ? `已根据当前位置重新规划，下一步：${nextInstruction}`
+          : `实时导航已开始，下一步：${nextInstruction}`,
+      )
+      speak(reason === 'reroute' ? `已重新规划路线。${nextInstruction}` : `开始导航。${nextInstruction}`, true)
+    } finally {
+      isReplanningRef.current = false
+      setIsReplanning(false)
+    }
+  }
+
+  async function handleNavigationPosition(location: BrowserLocation) {
+    setCurrentLocation(location)
+    updateUserMarker(location)
+    mapRef.current?.setCenter(location.coords)
+
+    const route = liveRouteRef.current
+    const targetPlace = navigationTargetRef.current
+    const destinationLocation = destinationLocationRef.current
+
+    if (!route || !targetPlace || !destinationLocation) {
+      return
+    }
+
+    const arrivalDistance = haversineDistance(location.coords, destinationLocation)
+
+    if (arrivalDistance <= ARRIVAL_DISTANCE_METERS) {
+      setNavigationStatus(`已到达 ${route.destinationName} 附近。`)
+      speak(`已到达 ${route.destinationName} 附近，导航结束。`, true)
+      stopLiveNavigation('已到达目的地。')
+      return
+    }
+
+    let nextStepIndex = currentStepIndexRef.current
+
+    while (nextStepIndex < route.steps.length - 1) {
+      const stepEndPoint = getStepEndPoint(route.steps[nextStepIndex])
+
+      if (!stepEndPoint || haversineDistance(location.coords, stepEndPoint) > STEP_ADVANCE_DISTANCE_METERS) {
+        break
+      }
+
+      nextStepIndex += 1
+    }
+
+    if (nextStepIndex !== currentStepIndexRef.current) {
+      currentStepIndexRef.current = nextStepIndex
+      setCurrentStepIndex(nextStepIndex)
+      const nextInstruction = route.steps[nextStepIndex]?.instruction ?? '继续沿路线前进'
+      setNavigationStatus(`即将进入下一段：${nextInstruction}`)
+      speak(nextInstruction, true)
+    } else if (route.steps[nextStepIndex]?.instruction) {
+      setNavigationStatus(`继续导航：${route.steps[nextStepIndex].instruction}`)
+    }
+
+    const routeDistance = distanceToPathMeters(location.coords, route.path)
+    const now = Date.now()
+
+    if (
+      route.path.length &&
+      routeDistance > ROUTE_DEVIATION_DISTANCE_METERS &&
+      now - lastRerouteAtRef.current > REROUTE_COOLDOWN_MS &&
+      !isReplanningRef.current
+    ) {
+      lastRerouteAtRef.current = now
+      setNavigationStatus('检测到当前位置偏离原路线，正在重新规划。')
+      speak('检测到偏离路线，正在重新规划。', true)
+      await rebuildRouteFromPosition(location, targetPlace, destinationLocation, 'reroute').catch((nextError) => {
+        setNavigationError(nextError instanceof Error ? nextError.message : '重新规划失败。')
+      })
+    }
+  }
+
+  async function startLiveNavigation() {
+    if (!isMapReady || !mapRef.current || !placeSearchRef.current || !walkingRef.current) {
+      setNavigationError('高德地图还没有初始化完成，请稍后再开始导航。')
+      return
+    }
+
+    if (!navigationTargetPlace) {
+      setNavigationError('请先选择一个终点，或点选地图/列表中的目标地点。')
+      return
+    }
+
+    if (!navigator.geolocation) {
+      setNavigationError('当前浏览器不支持实时定位。')
+      return
+    }
+
+    if (watchIdRef.current !== null) {
+      navigator.geolocation.clearWatch(watchIdRef.current)
+      watchIdRef.current = null
+    }
+
+    setIsNavigating(true)
+    isNavigatingRef.current = true
+    setNavigationError('')
+    setLiveRoute(null)
+    liveRouteRef.current = null
+    setCurrentStepIndex(0)
+    currentStepIndexRef.current = 0
+    lastSpokenTextRef.current = ''
+    setNavigationStatus('正在获取当前位置，请允许浏览器使用定位。')
+
+    try {
+      const location = await requestBrowserLocation()
+
+      if (!isNavigatingRef.current) {
+        return
+      }
+
+      setCurrentLocation(location)
+      updateUserMarker(location)
+      const destinationLocation = await resolvePlaceLocation(navigationTargetPlace)
+
+      if (!destinationLocation) {
+        throw new Error(`高德地图暂未精确识别 ${navigationTargetPlace.name}，无法开始实时导航。`)
+      }
+
+      destinationLocationRef.current = destinationLocation
+      setDestinationMarker(destinationLocation, navigationTargetPlace.name)
+      await rebuildRouteFromPosition(location, navigationTargetPlace, destinationLocation, 'start')
+
+      watchIdRef.current = navigator.geolocation.watchPosition(
+        (position) => {
+          void handleNavigationPosition(toBrowserLocation(position))
+        },
+        (nextError) => {
+          const message = getGeolocationErrorMessage(nextError)
+          setNavigationError(message)
+          setNavigationStatus('定位信号不稳定，请步行到开阔地带，系统会继续等待新位置。')
+          speak('定位信号不稳定，请步行到开阔地带。')
+        },
+        {
+          enableHighAccuracy: true,
+          maximumAge: 1_000,
+          timeout: 10_000,
+        },
+      )
+    } catch (nextError) {
+      setNavigationError(nextError instanceof Error ? nextError.message : '实时导航启动失败。')
+      setNavigationStatus('实时导航未能启动，请检查定位权限、网络和终点是否可识别。')
+      setIsNavigating(false)
+      isNavigatingRef.current = false
+    }
+  }
+
+  function stopLiveNavigation(nextStatus = '实时导航已退出。') {
+    if (watchIdRef.current !== null && navigator.geolocation) {
+      navigator.geolocation.clearWatch(watchIdRef.current)
+      watchIdRef.current = null
+    }
+
+    window.speechSynthesis?.cancel()
+    isNavigatingRef.current = false
+    isReplanningRef.current = false
+    setIsNavigating(false)
+    setIsReplanning(false)
+    setNavigationStatus(nextStatus)
+    setLiveRoute(null)
+    liveRouteRef.current = null
+    setCurrentStepIndex(0)
+    currentStepIndexRef.current = 0
+    destinationLocationRef.current = null
+    walkingRef.current?.clear?.()
+    clearNavigationMarkers()
+  }
+
+  function toggleVoice() {
+    const nextVoiceState = !voiceEnabledRef.current
+    voiceEnabledRef.current = nextVoiceState
+    setVoiceEnabled(nextVoiceState)
+
+    if (!nextVoiceState) {
+      window.speechSynthesis?.cancel()
+      return
+    }
+
+    speak(currentInstruction || navigationStatus, true)
+  }
 
   useEffect(() => {
     let cancelled = false
@@ -223,6 +849,9 @@ export function AmapLiveMap({
             position: 'LB',
             showCircle: true,
             showMarker: true,
+            enableHighAccuracy: true,
+            timeout: 10_000,
+            GeoLocationFirst: true,
           }),
         )
 
@@ -241,6 +870,8 @@ export function AmapLiveMap({
           map,
           hideMarkers: true,
           autoFitView: true,
+          isOutline: true,
+          outlineColor: '#ffffff',
         })
 
         for (const query of getCampusQueries(campus)) {
@@ -263,8 +894,9 @@ export function AmapLiveMap({
           }
         }
 
+        setIsMapReady(true)
         setError('')
-        setStatus('高德实景已就绪，可查看真实底图、定位与路线叠加。')
+        setStatus('高德实景已就绪，可查看真实底图、实时定位、步行路线和语音导航。')
       } catch (nextError) {
         setError(nextError instanceof Error ? nextError.message : '高德地图加载失败。')
         setStatus('高德地图初始化失败，请检查本地凭据或网络状态。')
@@ -275,11 +907,11 @@ export function AmapLiveMap({
 
     return () => {
       cancelled = true
-      overlaysRef.current.forEach((overlay) => overlay?.setMap?.(null))
-      overlaysRef.current = []
-      walkingRef.current?.clear?.()
+      stopLiveNavigation()
+      clearSceneOverlays()
       mapRef.current?.destroy?.()
       mapRef.current = null
+      setIsMapReady(false)
     }
   }, [campus])
 
@@ -291,84 +923,15 @@ export function AmapLiveMap({
         return
       }
 
-      function clearOverlays() {
-        overlaysRef.current.forEach((overlay) => overlay?.setMap?.(null))
-        overlaysRef.current = []
-        walkingRef.current?.clear?.()
+      if (isNavigatingRef.current) {
+        return
       }
 
-      function addMarker(
-        position: LngLatTuple,
-        title: string,
-        labelClassName = 'amap-live-label',
-        labelPrefix = '',
-      ) {
-        const marker = new AMapRef.current!.Marker({
-          position,
-          title,
-          label: {
-            content: `<div class="${labelClassName}">${labelPrefix}${title}</div>`,
-          },
-        })
-
-        overlaysRef.current.push(marker)
-        marker.setMap(mapRef.current)
-      }
-
-      async function searchKeyword(keyword: string) {
-        return await new Promise<AmapPoiRecord[]>((resolve) => {
-          placeSearchRef.current?.search(keyword, (searchStatus: string, result: AmapPoiResult) => {
-            if (searchStatus !== 'complete' || !result?.poiList?.pois?.length) {
-              resolve([])
-              return
-            }
-
-            resolve(result.poiList.pois)
-          })
-        })
-      }
-
-      async function resolvePlaceLocation(place: PlaceRecord) {
-        const cached = placeCacheRef.current.get(place.id)
-
-        if (cached) {
-          return cached
-        }
-
-        for (const query of getPlaceQueries(campus, place)) {
-          const pois = await searchKeyword(query)
-          const candidates = pois
-            .map((poi) => toLngLatTuple(poi.location))
-            .filter((value): value is LngLatTuple => value !== null)
-
-          if (!candidates.length) {
-            continue
-          }
-
-          const nearby = candidates
-            .map((candidate) => ({
-              candidate,
-              distance: haversineDistance(campusCenterRef.current, candidate),
-            }))
-            .sort((left, right) => left.distance - right.distance)
-
-          const bestCandidate =
-            nearby.find((item) => item.distance <= CAMPUS_MAX_DISTANCE_METERS)?.candidate ??
-            candidates[0]
-
-          placeCacheRef.current.set(place.id, bestCandidate)
-          return bestCandidate
-        }
-
-        return null
-      }
-
-      clearOverlays()
+      clearSceneOverlays()
       setError('')
 
       const startPlace = keyedPlaces[startPlaceId]
-      const endPlace = keyedPlaces[endPlaceId]
-      const selectedPlace = keyedPlaces[selectedPlaceId]
+      const selectedScenePlace = keyedPlaces[selectedPlaceId]
 
       if (livePoi) {
         const location: LngLatTuple = [livePoi.lng, livePoi.lat]
@@ -405,13 +968,13 @@ export function AmapLiveMap({
         walkingRef.current?.search(
           startLocation,
           endLocation,
-          (searchStatus: string, result: AmapWalkingResult) => {
+          (searchStatus: string, result: AmapWalkingResult | string) => {
             if (cancelled) {
               return
             }
 
-            if (searchStatus === 'complete' && result?.routes?.length) {
-              setStatus('高德实景步行路线已生成，可与本地路网路线对照查看。')
+            if (searchStatus === 'complete' && typeof result !== 'string' && result?.routes?.length) {
+              setStatus('高德实景步行路线已生成，可点击“开始实时导航”切换为当前位置引导。')
               return
             }
 
@@ -423,24 +986,24 @@ export function AmapLiveMap({
         return
       }
 
-      if (selectedPlace) {
-        setStatus(`正在高德实景中定位 ${selectedPlace.name}。`)
-        const location = await resolvePlaceLocation(selectedPlace)
+      if (selectedScenePlace) {
+        setStatus(`正在高德实景中定位 ${selectedScenePlace.name}。`)
+        const location = await resolvePlaceLocation(selectedScenePlace)
 
         if (cancelled) {
           return
         }
 
         if (!location) {
-          setError(`高德地图暂未精确识别 ${selectedPlace.name}，可以继续参考本地路网图。`)
+          setError(`高德地图暂未精确识别 ${selectedScenePlace.name}，可以继续参考本地路网图。`)
           setStatus('高德实景已加载，但当前点位未成功匹配。')
           return
         }
 
-        addMarker(location, selectedPlace.name)
+        addMarker(location, selectedScenePlace.name)
         mapRef.current.setCenter(location)
         mapRef.current.setZoom(17)
-        setStatus(`已在高德实景中定位 ${selectedPlace.name}。`)
+        setStatus(`已在高德实景中定位 ${selectedScenePlace.name}。`)
         return
       }
 
@@ -454,11 +1017,95 @@ export function AmapLiveMap({
     return () => {
       cancelled = true
     }
-  }, [campus, endPlaceId, keyedPlaces, livePoi, selectedPlaceId, startPlaceId])
+  }, [campus, endPlace, keyedPlaces, livePoi, selectedPlaceId, startPlaceId])
+
+  useEffect(() => {
+    if (!isNavigating || !liveRoute || !navigationTargetPlace) {
+      return
+    }
+
+    if (navigationTargetPlace.id !== liveRoute.destinationPlaceId) {
+      stopLiveNavigation('终点已改变，已结束当前实时导航，请重新开始。')
+    }
+  }, [isNavigating, liveRoute, navigationTargetPlace])
 
   return (
     <div className="amap-panel">
       <div ref={containerRef} className="amap-panel__container" aria-label="高德实景地图" />
+      <section className="amap-navigation-card" aria-labelledby="live-navigation-title">
+        <div className="amap-navigation-card__header">
+          <div>
+            <strong id="live-navigation-title">实时步行导航</strong>
+            <p>
+              目标：
+              {navigationTargetPlace ? navigationTargetPlace.name : '请先选择终点或点选地点'}
+            </p>
+          </div>
+          <span className={isNavigating ? 'live-navigation-badge live-navigation-badge--active' : 'live-navigation-badge'}>
+            {isNavigating ? (isReplanning ? '重规划中' : '导航中') : '待开始'}
+          </span>
+        </div>
+
+        <div className="amap-navigation-card__actions">
+          <button
+            type="button"
+            className="amap-navigation-card__primary"
+            disabled={!isMapReady || !navigationTargetPlace}
+            onClick={() => {
+              if (isNavigating) {
+                stopLiveNavigation()
+                return
+              }
+
+              void startLiveNavigation()
+            }}
+          >
+            {isNavigating ? '结束实时导航' : '开始实时导航'}
+          </button>
+          <button type="button" className="amap-navigation-card__secondary" onClick={toggleVoice}>
+            {voiceEnabled ? '关闭语音' : '开启语音'}
+          </button>
+        </div>
+
+        <p className="amap-navigation-card__status" aria-live="polite">
+          {navigationStatus}
+        </p>
+        {navigationError ? <p className="amap-panel__error">{navigationError}</p> : null}
+
+        <div className="amap-navigation-metrics">
+          <div>
+            <span>路线距离</span>
+            <strong>{liveRoute ? formatDistance(liveRoute.distanceMeters) : '未生成'}</strong>
+          </div>
+          <div>
+            <span>预计步行</span>
+            <strong>{liveRoute ? formatDuration(liveRoute.timeSeconds) : '未生成'}</strong>
+          </div>
+          <div>
+            <span>定位精度</span>
+            <strong>{currentLocation ? `约 ${Math.round(currentLocation.accuracy)} 米` : '未定位'}</strong>
+          </div>
+        </div>
+
+        {currentInstruction ? (
+          <div className="amap-navigation-card__instruction">
+            <span>下一步</span>
+            <strong>{currentInstruction}</strong>
+          </div>
+        ) : null}
+
+        {remainingSteps.length ? (
+          <ol className="amap-navigation-steps">
+            {remainingSteps.map((step, index) => (
+              <li key={`${step.instruction}-${index}`}>
+                <span>{currentStepIndex + index + 1}</span>
+                <p>{step.instruction}</p>
+                <small>{formatDistance(step.distanceMeters)}</small>
+              </li>
+            ))}
+          </ol>
+        ) : null}
+      </section>
       <div className="amap-panel__status" aria-live="polite">
         <strong>高德实景</strong>
         <p>{status}</p>
